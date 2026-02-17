@@ -83,7 +83,7 @@ def align_up(n, alignment):
 
 
 def main():
-    data = read_file('analysis/fix_charger_stripped.o')
+    data = read_file('fix_charger_stripped.o')
     file_len = len(data)
 
     # Parse ELF header
@@ -407,7 +407,7 @@ def main():
     else:
         print(f"  All {out_shnum} sections valid")
 
-    write_file('analysis/fix_charger.ko', elf)
+    write_file('fix_charger.ko', elf)
     print(f"\nBuilt fix_charger.ko: {total_file_len} bytes, {out_shnum} sections")
 
 

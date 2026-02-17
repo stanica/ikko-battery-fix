@@ -81,6 +81,25 @@ static int skip_function(struct kprobe *p, struct pt_regs *regs)
 }
 
 /*
+ * Throttled pre-handler for mtk_charger_external_power_changed.
+ * Allow the function to execute once every ~60 calls (~2 seconds at
+ * 30 calls/sec feedback rate). This breaks the busy loop while still
+ * allowing real charger plug/unplug events to be detected promptly.
+ */
+static int throttle_count;
+
+static int throttle_function(struct kprobe *p, struct pt_regs *regs)
+{
+	if (++throttle_count >= 60) {
+		throttle_count = 0;
+		return 0; /* let it run */
+	}
+	regs->regs[0] = 0;
+	regs->pc = regs->regs[30];
+	return 1; /* skip */
+}
+
+/*
  * Address markers — patched by loader script with actual addresses from kallsyms.
  * This is necessary because:
  * - eta6965_dump_register exists in TWO modules, kallsyms_lookup_name returns wrong one
@@ -102,7 +121,7 @@ static struct kprobe kp_dump2 = {
 
 static struct kprobe kp_pwr = {
 	.addr = ADDR_MARKER_3,
-	.pre_handler = (void *)skip_function,
+	.pre_handler = (void *)throttle_function,
 };
 
 #define NUM_KPROBES 3

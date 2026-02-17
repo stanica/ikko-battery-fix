@@ -5,7 +5,7 @@
 # Three kprobes:
 # 1. eta6965_dump_register in eta6965_charger (skip I2C register dump)
 # 2. eta6965_dump_register in eta6965_charger_sec (skip I2C register dump)
-# 3. mtk_charger_external_power_changed (break feedback wakeup loop)
+# 3. mtk_charger_external_power_changed (throttle feedback wakeup loop)
 
 MODDIR="${0%/*}"
 KO_TEMPLATE="$MODDIR/fix_charger.ko"
@@ -13,9 +13,9 @@ KO_PATCHED="/data/local/tmp/fix_charger_patched.ko"
 LOG="/data/local/tmp/fix_charger.log"
 
 # Fixed offsets of address markers in fix_charger.ko (from build)
-OFFSET1=1808   # FEEDFACECAFEBABE - eta6965_charger:dump_register
-OFFSET2=1944   # DEADC0DEBEEFCAFE - eta6965_charger_sec:dump_register
-OFFSET3=2080   # BADDF00DCAFEF00D - mtk_charger_framework:external_power_changed
+OFFSET1=2008   # FEEDFACECAFEBABE - eta6965_charger:dump_register
+OFFSET2=2144   # DEADC0DEBEEFCAFE - eta6965_charger_sec:dump_register
+OFFSET3=2280   # BADDF00DCAFEF00D - mtk_charger_framework:external_power_changed
 
 log() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') $1" >> "$LOG"
