@@ -9,6 +9,7 @@
  * 3: eta6965_enable_vbus in eta6965_charger (set OTG flag on plug)
  * 4: eta6965_disable_vbus in eta6965_charger (clear OTG flag on unplug)
  * 5: eta6965_charger_get_property in eta6965_charger (fix online during OTG)
+ * 6: mtk_charger_external_power_changed in mtk_charger (throttle feedback loop)
  */
 
 /* Minimal type definitions for arm64 kernel module */
@@ -131,6 +132,29 @@ static int fix_online_in_otg(struct kprobe *p, struct pt_regs *regs)
 }
 
 /*
+ * Throttle mtk_charger_external_power_changed.
+ *
+ * This callback fires every time a power_supply property changes.
+ * The charger thread updates properties on every 2s cycle, which
+ * triggers this callback, which wakes the charger thread early,
+ * creating a ~30 Hz feedback loop.  We let every 60th call through
+ * (one every ~2 seconds) to break the loop while still allowing
+ * periodic updates.
+ */
+static u64 epc_count;
+#define EPC_INTERVAL 60
+
+static int throttle_epc(struct kprobe *p, struct pt_regs *regs)
+{
+	if (++epc_count % EPC_INTERVAL != 0) {
+		regs->regs[0] = 0;
+		regs->pc = regs->regs[30];
+		return 1;
+	}
+	return 0; /* let every 60th call through */
+}
+
+/*
  * Address markers — patched by loader script with actual addresses from kallsyms.
  */
 #define ADDR_MARKER_1 ((void *)0xFEEDFACECAFEBABEULL)  /* eta6965_charger: dump_register */
@@ -138,6 +162,7 @@ static int fix_online_in_otg(struct kprobe *p, struct pt_regs *regs)
 #define ADDR_MARKER_3 ((void *)0xCAFEBABE12345678ULL)  /* eta6965_charger: enable_vbus */
 #define ADDR_MARKER_4 ((void *)0xDEADBEEF87654321ULL)  /* eta6965_charger: disable_vbus */
 #define ADDR_MARKER_5 ((void *)0xBAADF00DDEADBEEFULL)  /* eta6965_charger: get_property */
+#define ADDR_MARKER_6 ((void *)0x1234ABCD5678EF01ULL)  /* mtk_charger: ext_power_changed */
 
 static struct kprobe kp_dump1 = {
 	.addr = ADDR_MARKER_1,
@@ -164,7 +189,12 @@ static struct kprobe kp_prop = {
 	.pre_handler = (void *)fix_online_in_otg,
 };
 
-#define NUM_KPROBES 5
+static struct kprobe kp_epc = {
+	.addr = ADDR_MARKER_6,
+	.pre_handler = (void *)throttle_epc,
+};
+
+#define NUM_KPROBES 6
 static struct kprobe *all_kprobes[NUM_KPROBES];
 static int num_registered;
 
@@ -175,7 +205,8 @@ int __attribute__((section(".init.text"))) init_module(void)
 	return -22;
 #else
 	struct kprobe *probes[NUM_KPROBES] = {
-		&kp_dump1, &kp_dump2, &kp_vbus_on, &kp_vbus_off, &kp_prop
+		&kp_dump1, &kp_dump2, &kp_vbus_on, &kp_vbus_off, &kp_prop,
+		&kp_epc
 	};
 	int i, ret;
 

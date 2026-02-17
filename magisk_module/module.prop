@@ -1,6 +1,6 @@
 id=fix_charger
 name=Fix Charger Thread CPU
-version=v1.3
-versionCode=4
+version=v1.4
+versionCode=5
 author=ikko-research
 description=Fix charger_thread CPU busy loop and OTG false charging detection
