@@ -1,6 +1,6 @@
 id=fix_charger
 name=Fix Charger Thread CPU
-version=v1.0
-versionCode=1
+version=v1.3
+versionCode=4
 author=ikko-research
-description=Fixes eta6965 charger_thread busy loop via kprobes (25% CPU -> 0%)
+description=Fix charger_thread CPU busy loop and OTG false charging detection

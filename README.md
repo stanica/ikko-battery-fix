@@ -1,29 +1,46 @@
 # IKKO Battery Fix
 
-Magisk module that fixes a kernel bug causing 25% CPU usage on IKKO devices with the ETA6965 charger IC (MediaTek MT6789).
+Magisk module that fixes two kernel bugs on IKKO devices with the ETA6965 charger IC (MediaTek MT6789):
 
-## The Problem
+1. **25% CPU usage** from `charger_thread` busy loop
+2. **False "Charging" notification** when USB-C OTG accessories are plugged in
 
-Three functions in the charger driver stack run in a tight feedback loop ~30 times per second:
+## The Problems
+
+### CPU busy loop
+
+Two functions in the charger driver stack run in a tight feedback loop ~30 times per second:
 
 1. **`eta6965_dump_register`** (in `eta6965_charger`) — reads all I2C registers from the charger IC and logs them via `printk`. Nothing consumes this data. Debug code left in production.
 
 2. **`eta6965_dump_register`** (in `eta6965_charger_sec`) — same function duplicated in the secondary charger driver.
 
-3. **`mtk_charger_external_power_changed`** (in `mtk_charger_framework`) — callback that fires when power supply properties change. The charger thread updates properties on every cycle, which triggers this callback, which wakes the charger thread, creating an infinite feedback loop.
-
 The result: `charger_thread` burns ~25% of one CPU core continuously, even with the screen off and no charger connected.
+
+### OTG false charging detection
+
+When a USB-C OTG adapter (or any VBUS-providing accessory) is plugged in, the device supplies 5V on VBUS for the attached peripheral. The ETA6965 charger IC sees this voltage on VBUS and erroneously reports `online=1` — it doesn't check whether the device is in source/host mode. Android interprets this as "charger connected" and shows a charging notification, even though the device is *providing* power, not receiving it.
 
 ## The Fix
 
-A kernel module (`fix_charger.ko`) uses [kprobes](https://www.kernel.org/doc/html/latest/trace/kprobes.html) to intercept all three functions and make them return immediately. The charger thread continues to run on its normal 2-second timer for battery management — it just stops doing the useless busywork between cycles.
+A kernel module (`fix_charger.ko`) uses [kprobes](https://www.kernel.org/doc/html/latest/trace/kprobes.html) to install five probes:
+
+| # | Target function | Module | Action |
+|---|---|---|---|
+| 1 | `eta6965_dump_register` | `eta6965_charger` | Skip (return 0) — eliminates I2C busy loop |
+| 2 | `eta6965_dump_register` | `eta6965_charger_sec` | Skip (return 0) — eliminates I2C busy loop |
+| 3 | `eta6965_enable_vbus` | `eta6965_charger` | Set OTG flag — tracks when VBUS power is enabled |
+| 4 | `eta6965_disable_vbus` | `eta6965_charger` | Clear OTG flag — tracks when VBUS power is disabled |
+| 5 | `eta6965_charger_get_property` | `eta6965_charger` | When OTG flag is set and property is `POWER_SUPPLY_PROP_ONLINE`, override to return 0 (not charging) |
+
+The charger thread continues to run on its normal 2-second timer for battery management — it just stops doing the useless I2C register dumps. Real charger detection (actual USB charger plugged in) is unaffected.
 
 ### Boot-time address resolution
 
 Because KASLR randomizes kernel module addresses on every boot, the Magisk `service.sh` script:
 
 1. Temporarily sets `kptr_restrict=0` to read `/proc/kallsyms`
-2. Resolves the three function addresses (filtering by module name to handle the duplicate symbol)
+2. Resolves all five function addresses (filtering by module name to handle duplicate symbols)
 3. Patches the addresses into the `.ko` template at fixed byte offsets
 4. Loads the patched module with `insmod`
 
@@ -31,7 +48,7 @@ Because KASLR randomizes kernel module addresses on every boot, the Magisk `serv
 
 **Requires**: Magisk, firmware v2.112.5.92(1204), kernel `5.10.233-android12-9-00062-g49c66df526b8-ab13101360`
 
-1. Download `fix_charger_magisk_v1.0.zip` from [Releases](../../releases)
+1. Download `fix_charger_magisk_v1.3.zip` from [Releases](../../releases)
 2. Open Magisk → Modules → Install from storage
 3. Select the ZIP
 4. Reboot
@@ -77,7 +94,7 @@ $NDK/toolchains/llvm/prebuilt/*/bin/llvm-objcopy \
 python build_ko.py
 ```
 
-The output `fix_charger.ko` contains marker addresses (`0xFEEDFACECAFEBABE`, `0xDEADC0DEBEEFCAFE`, `0xBADDF00DCAFEF00D`) that get patched with real kernel addresses by `service.sh` at boot.
+The output `fix_charger.ko` contains marker addresses (`0xFEEDFACECAFEBABE`, `0xDEADC0DEBEEFCAFE`, `0xCAFEBABE12345678`, `0xDEADBEEF87654321`, `0xBAADF00DDEADBEEF`) that get patched with real kernel addresses by `service.sh` at boot.
 
 ### MODVERSIONS
 
@@ -88,9 +105,21 @@ The `.ko` includes CRC entries that must match the running kernel. If targeting 
 ```bash
 cd magisk_module
 cp ../fix_charger.ko .
-zip -r ../fix_charger_magisk_v1.0.zip \
+zip -r ../fix_charger_magisk_v1.3.zip \
     META-INF/ module.prop customize.sh service.sh fix_charger.ko
 ```
+
+## Changelog
+
+### v1.3
+- Fix false "Charging" notification during USB-C OTG (3 new kprobes: enable_vbus, disable_vbus, get_property)
+- Removed `external_power_changed` throttle from v1.1 (dump_register skips alone fix CPU)
+
+### v1.1
+- Added throttle on `mtk_charger_external_power_changed` (later removed in v1.3)
+
+### v1.0
+- Initial release — skip `eta6965_dump_register` in both charger modules
 
 ## Files
 

@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * fix_charger.ko - Fix charger_thread busy loop via kprobes
+ * fix_charger.ko - Fix charger_thread busy loop and OTG detection via kprobes
  * Self-contained: no kernel headers needed beyond compiler builtins
  *
  * Probes:
- * 1-2: eta6965_dump_register in both charger modules (skip I2C reg dump)
- * 3:   mtk_charger_external_power_changed (stop feedback wakeup loop)
+ * 1: eta6965_dump_register in eta6965_charger (skip I2C reg dump)
+ * 2: eta6965_dump_register in eta6965_charger_sec (skip I2C reg dump)
+ * 3: eta6965_enable_vbus in eta6965_charger (set OTG flag on plug)
+ * 4: eta6965_disable_vbus in eta6965_charger (clear OTG flag on unplug)
+ * 5: eta6965_charger_get_property in eta6965_charger (fix online during OTG)
  */
 
 /* Minimal type definitions for arm64 kernel module */
@@ -81,33 +84,60 @@ static int skip_function(struct kprobe *p, struct pt_regs *regs)
 }
 
 /*
- * Throttled pre-handler for mtk_charger_external_power_changed.
- * Allow the function to execute once every ~60 calls (~2 seconds at
- * 30 calls/sec feedback rate). This breaks the busy loop while still
- * allowing real charger plug/unplug events to be detected promptly.
+ * OTG VBUS state tracking.
+ *
+ * eta6965_enable_vbus and eta6965_disable_vbus are separate functions
+ * called by rt-pd-manager when a USB-C OTG adapter is plugged/unplugged.
+ * We track the state so fix_online_in_otg can suppress the bogus
+ * "USB powered" report caused by the charger IC seeing its own VBUS output.
  */
-static int throttle_count;
+static int otg_active;
 
-static int throttle_function(struct kprobe *p, struct pt_regs *regs)
+static int set_otg_active(struct kprobe *p, struct pt_regs *regs)
 {
-	if (++throttle_count >= 60) {
-		throttle_count = 0;
-		return 0; /* let it run */
+	otg_active = 1;
+	return 0; /* let eta6965_enable_vbus execute normally */
+}
+
+static int clear_otg_active(struct kprobe *p, struct pt_regs *regs)
+{
+	otg_active = 0;
+	return 0; /* let eta6965_disable_vbus execute normally */
+}
+
+/*
+ * Fix "USB powered: true" during OTG.
+ *
+ * eta6965_charger_get_property(struct power_supply *psy,
+ *     enum power_supply_property psp, union power_supply_propval *val)
+ *   x0 = psy, x1 = property enum, x2 = &val->intval
+ *
+ * POWER_SUPPLY_PROP_ONLINE = 4 in Linux 5.10 (stable since 2.6.x).
+ * When OTG is active, the charger IC hardware erroneously reports
+ * VBUS present (because the device itself is generating 5V for OTG).
+ * We override online=0 to prevent Android from showing "Charging".
+ */
+#define PSP_ONLINE 4
+
+static int fix_online_in_otg(struct kprobe *p, struct pt_regs *regs)
+{
+	if (otg_active && regs->regs[1] == PSP_ONLINE) {
+		*(u32 *)regs->regs[2] = 0;  /* val->intval = 0 */
+		regs->regs[0] = 0;          /* return 0 (success) */
+		regs->pc = regs->regs[30];  /* skip to caller */
+		return 1;
 	}
-	regs->regs[0] = 0;
-	regs->pc = regs->regs[30];
-	return 1; /* skip */
+	return 0; /* let function run for all other properties */
 }
 
 /*
  * Address markers — patched by loader script with actual addresses from kallsyms.
- * This is necessary because:
- * - eta6965_dump_register exists in TWO modules, kallsyms_lookup_name returns wrong one
- * - mtk_charger_external_power_changed is unique but we use addr for consistency
  */
 #define ADDR_MARKER_1 ((void *)0xFEEDFACECAFEBABEULL)  /* eta6965_charger: dump_register */
 #define ADDR_MARKER_2 ((void *)0xDEADC0DEBEEFCAFEULL)  /* eta6965_charger_sec: dump_register */
-#define ADDR_MARKER_3 ((void *)0xBADDF00DCAFEF00DULL)  /* mtk_charger_framework: external_power_changed */
+#define ADDR_MARKER_3 ((void *)0xCAFEBABE12345678ULL)  /* eta6965_charger: enable_vbus */
+#define ADDR_MARKER_4 ((void *)0xDEADBEEF87654321ULL)  /* eta6965_charger: disable_vbus */
+#define ADDR_MARKER_5 ((void *)0xBAADF00DDEADBEEFULL)  /* eta6965_charger: get_property */
 
 static struct kprobe kp_dump1 = {
 	.addr = ADDR_MARKER_1,
@@ -119,12 +149,22 @@ static struct kprobe kp_dump2 = {
 	.pre_handler = (void *)skip_function,
 };
 
-static struct kprobe kp_pwr = {
+static struct kprobe kp_vbus_on = {
 	.addr = ADDR_MARKER_3,
-	.pre_handler = (void *)throttle_function,
+	.pre_handler = (void *)set_otg_active,
 };
 
-#define NUM_KPROBES 3
+static struct kprobe kp_vbus_off = {
+	.addr = ADDR_MARKER_4,
+	.pre_handler = (void *)clear_otg_active,
+};
+
+static struct kprobe kp_prop = {
+	.addr = ADDR_MARKER_5,
+	.pre_handler = (void *)fix_online_in_otg,
+};
+
+#define NUM_KPROBES 5
 static struct kprobe *all_kprobes[NUM_KPROBES];
 static int num_registered;
 
@@ -134,7 +174,9 @@ int __attribute__((section(".init.text"))) init_module(void)
 	printk("fix_charger: test load OK\n");
 	return -22;
 #else
-	struct kprobe *probes[NUM_KPROBES] = { &kp_dump1, &kp_dump2, &kp_pwr };
+	struct kprobe *probes[NUM_KPROBES] = {
+		&kp_dump1, &kp_dump2, &kp_vbus_on, &kp_vbus_off, &kp_prop
+	};
 	int i, ret;
 
 	num_registered = 0;
@@ -168,7 +210,7 @@ void __attribute__((section(".exit.text"))) cleanup_module(void)
 static const char __modinfo_license[] __attribute__((used, section(".modinfo"))) =
 	"license=GPL";
 static const char __modinfo_description[] __attribute__((used, section(".modinfo"))) =
-	"description=Fix charger_thread busy loop by skipping dump_register and throttling wakeups";
+	"description=Fix charger_thread busy loop and OTG charger detection";
 static const char __modinfo_vermagic[] __attribute__((used, section(".modinfo"))) =
 	"vermagic=5.10.233-android12-9-00062-g49c66df526b8-ab13101360 SMP preempt mod_unload modversions aarch64";
 static const char __modinfo_name[] __attribute__((used, section(".modinfo"))) =
