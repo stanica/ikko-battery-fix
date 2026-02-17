@@ -1,0 +1,4 @@
+*.o
+*_stripped.o
+*_patched.ko
+*.zip
